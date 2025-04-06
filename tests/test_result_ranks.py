@@ -1,6 +1,13 @@
 import pytest
-from barcode_validator.result import DNAAnalysisResult
+from nbitk.Taxon import Taxon
+from barcode_validator.result import DNAAnalysisResult, reset_columns, initialize_columns
 
+
+@pytest.fixture(autouse=True)
+def setup_columns():
+    """Automatically reset columns before each test"""
+    initialize_columns()
+    yield
 
 @pytest.fixture
 def dna_result():
@@ -64,6 +71,27 @@ def test_edge_case_marker(dna_result):
     assert "\u26D4 Unacceptable marker sequence" in messages
 
 
+def test_columns(dna_result):
+    columns = dna_result.result_fields()
+    assert len(columns) == 13
+
+
+def test_values(dna_result):
+    dna_result.seq_length = 650
+    dna_result.full_length = 1501
+    dna_result.obs_taxon = [ Taxon(name="Family", taxonomic_rank='family') ]
+    dna_result.exp_taxon = Taxon(name="Family", taxonomic_rank='family')
+    dna_result.species = Taxon(name="Genus species", taxonomic_rank='species')
+    dna_result.stop_codons = [ 678 ]
+    dna_result.ambiguities = 3
+    dna_result.full_ambiguities = 3
+    dna_result.level = 'family'
+    dna_result.ancillary = { 'foo': 'bar' }
+    dna_result.error = 'error message'
+    values = dna_result.get_values()
+    assert len(values) == 14
+
+
 def test_edge_case_full(dna_result):
     # Test when full_length or full_ambiguities are None
     dna_result.seq_length = 650
@@ -72,3 +100,7 @@ def test_edge_case_full(dna_result):
     assert barcode_rank == 1
     assert full_rank == 6
     assert "\u26D4 Unacceptable full sequence" in messages
+
+
+if __name__ == '__main__':
+    pytest.main()

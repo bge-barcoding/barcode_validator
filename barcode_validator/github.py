@@ -1,20 +1,26 @@
-import logging
 import subprocess
+from fileinput import filename
+
 import requests
 import os
+from nbitk.config import Config
+from nbitk.logger import get_formatted_logger
 
 
 class GitHubClient:
-    def __init__(self, repo_owner, repo_name, github_token, clone_path):
-        self.repo_owner = repo_owner
-        self.repo_name = repo_name
-        self.github_token = github_token
-        self.clone_path = clone_path
-        self.base_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
+    def __init__(self, config: Config):
+        class_name = self.__class__.__name__
+        self.logger = get_formatted_logger(class_name, config)
+        self.repo_owner = config.get('repo_owner')
+        self.repo_name = config.get('repo_name')
+        self.github_token = os.environ.get('GITHUB_TOKEN')
+        self.clone_path = config.get('repo_location')
+        self.base_url = f"https://api.github.com/repos/{self.repo_owner}/{self.repo_name}"
         self.headers = {
-            "Authorization": f"token {github_token}",
+            "Authorization": f"token {self.github_token}",
             "Accept": "application/vnd.github.v3+json"
         }
+        self.logger.info(f'GitHub client initialized for {self.repo_owner}/{self.repo_name}')
 
     def get_open_prs(self):
         """
@@ -38,6 +44,53 @@ class GitHubClient:
         response.raise_for_status()
         return response.json()
 
+    def fetch_pr_files(self, branch, pr_number, extensions):
+        """
+        Fetch the FASTA files from a pull request.
+        :param branch: The branch name
+        :param pr_number: The pull request number
+        :param extensions: A list of file extensions to filter by, e.g. ['.fasta', '.fa', '.fas']
+        :return: A list of FASTA files
+        """
+
+        # Fetch the latest changes
+        self.logger.info(f"Fetching latest changes for PR {pr_number}")
+        self.run_git_command(['git', 'fetch', 'origin'], "Failed to fetch from origin")
+
+        # Create or reset the PR branch
+        pr_branch = f"pr-{pr_number}"
+        self.logger.info(f"Creating/resetting branch {pr_branch}")
+        self.run_git_command(['git', 'checkout', '-B', pr_branch, f'origin/{branch}'],
+                                f"Failed to create/reset branch {pr_branch}")
+
+        # Request the JSON info about the files from the PR matching the extension
+        self.logger.info(f"Getting files for PR {pr_number}")
+        files = self.get_pr_files(pr_number)
+        extensions_tuple = tuple(extensions)
+        matching_files = [f for f in files if f['filename'].lower().endswith(extensions_tuple)]
+        self.logger.info(f"Found {len(matching_files)} files with {extensions} in PR {pr_number}")
+
+        # Download the files
+        result = []
+        for file in matching_files:
+
+            # Fetch file content
+            file_url = file['raw_url']
+            self.logger.info(f"Fetching file from {file_url}")
+            response = requests.get(file_url, headers=self.headers)
+            if response.status_code == 200:
+
+                # Create directory if it doesn't exist
+                os.makedirs(os.path.dirname(file['filename']), exist_ok=True)
+
+                # Save file content
+                self.logger.info(f"Saving file content to {file['filename']}")
+                with open(file['filename'], 'wb') as f:
+                    f.write(response.content)
+                    result.append(file['filename'])
+
+        return result
+
     def post_comment(self, pr_number, comment):
         """
         Post a comment on a pull request.
@@ -48,7 +101,7 @@ class GitHubClient:
         url = f"{self.base_url}/issues/{pr_number}/comments"
         data = {"body": comment}
         response = requests.post(url, headers=self.headers, json=data)
-        logging.info(response)
+        self.logger.info(response)
         response.raise_for_status()
         return response.json()
 
@@ -62,7 +115,7 @@ class GitHubClient:
         self.ensure_correct_directory()
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
-            logging.error(f"{error_message}: {result.stderr}")
+            self.logger.error(f"{error_message}: {result.stderr}")
             raise RuntimeError(f"Git command failed: {' '.join(command)}")
         return result.stdout
 
@@ -83,5 +136,5 @@ class GitHubClient:
         """
         current_dir = os.getcwd()
         if current_dir != self.clone_path:
-            logging.debug(f"Changing working directory from {current_dir} to {self.clone_path}")
+            self.logger.debug(f"Changing working directory from {current_dir} to {self.clone_path}")
             os.chdir(self.clone_path)

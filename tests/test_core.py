@@ -4,26 +4,32 @@ from Bio.SeqRecord import SeqRecord
 from Bio.Seq import Seq
 from Bio.Phylo.BaseTree import Tree, Clade
 from nbitk.Taxon import Taxon
-from barcode_validator.config import Config
+from nbitk.config import Config
 from barcode_validator.result import DNAAnalysisResult
 from barcode_validator.core import BarcodeValidator
 
 
 @pytest.fixture
 def mock_config():
-    config = Mock(spec=Config)
-    config.get.side_effect = lambda key: {
-        'level': 'family',
-        'constrain': 'order',
-        'hmm_file': 'mock_hmm.hmm',
-        'translation_table': 1
-    }[key]
-    return config
+    class ConfigMock(Mock):
+        def get(self, key, default=None):
+            values = {
+                'level': 'family',
+                'constrain': 'order',
+                'hmm_file': 'mock_hmm.hmm',
+                'translation_table': 1,
+                'ncbi_taxonomy': 'mock_ncbi.tar.gz',
+                'bold_sheet_file': 'mock_bold.xlsx',
+                'log_level': 'ERROR',
+                'tool_name': 'hmmalign',
+            }
+            return values.get(key, default)
 
+    return ConfigMock(spec=Config)
 
 @pytest.fixture
-def barcode_validator():
-    return BarcodeValidator()
+def barcode_validator(mock_config):
+    return BarcodeValidator(mock_config)
 
 
 @pytest.fixture
@@ -51,7 +57,7 @@ def test_initialize(barcode_validator):
         mock_ncbi_parser.return_value.parse.return_value = Mock(spec=Tree)
         mock_bold_parser.return_value.parse.return_value = Mock(spec=Tree)
 
-        barcode_validator.initialize('mock_ncbi.tar.gz', 'mock_bold.xlsx')
+        barcode_validator.initialize()
 
         assert isinstance(barcode_validator.ncbi_tree, Mock)
         assert isinstance(barcode_validator.bold_tree, Mock)
@@ -60,8 +66,8 @@ def test_initialize(barcode_validator):
 @patch('barcode_validator.alignment.SequenceHandler.parse_fasta')
 def test_validate_fasta(mock_parse_fasta, barcode_validator, mock_config):
     mock_parse_fasta.return_value = [
-        ('process1', SeqRecord(Seq('ATCG'), id='seq1'), {}),
-        ('process2', SeqRecord(Seq('GCTA'), id='seq2'), {})
+        (SeqRecord(Seq('ATCG'), id='seq1'), {}),
+        (SeqRecord(Seq('GCTA'), id='seq2'), {})
     ]
 
     with patch.object(barcode_validator, 'validate_record', return_value=Mock(spec=DNAAnalysisResult)) as mock_validate:
@@ -73,10 +79,12 @@ def test_validate_fasta(mock_parse_fasta, barcode_validator, mock_config):
 
 def test_validate_record(mock_trees, mock_config):
     record = SeqRecord(Seq('ATCG'), id='seq1')
+    record.annotations['bcdm_fields'] = { 'processid': 'process1' }
 
     with patch.object(mock_trees, 'validate_sequence_quality') as mock_validate_quality, \
             patch.object(mock_trees, 'validate_taxonomy') as mock_validate_taxonomy:
-        result = mock_trees.validate_record('process1', record, mock_config)
+        result = DNAAnalysisResult('process1')
+        mock_trees.validate_record(record, mock_config, result)
 
         assert isinstance(result, DNAAnalysisResult)
         mock_validate_quality.assert_called_once()
@@ -85,6 +93,7 @@ def test_validate_record(mock_trees, mock_config):
 
 def test_validate_taxonomy(mock_trees, mock_config):
     record = SeqRecord(Seq('ATCG'), id='seq1')
+    record.annotations['bcdm_fields'] = { 'processid': 'process1' }
     result = DNAAnalysisResult('process1')
 
     mock_species = Mock(spec=Taxon)
@@ -97,7 +106,7 @@ def test_validate_taxonomy(mock_trees, mock_config):
 
     mock_trees.bold_tree.root.get_path.return_value = [mock_exp_taxon, mock_species]
 
-    with patch.object(mock_trees, 'get_tip_by_processid', return_value=mock_species), \
+    with patch.object(mock_trees, 'get_node_by_processid', return_value=mock_species), \
             patch.object(mock_trees, 'build_constraint', return_value='1234'), \
             patch('barcode_validator.core.BlastRunner') as MockBlastRunner:
         MockBlastRunner.return_value.run_localblast.return_value = mock_obs_taxon
@@ -110,12 +119,12 @@ def test_validate_taxonomy(mock_trees, mock_config):
         assert result.error is None
 
     # Test error case when species is not found
-    with patch.object(mock_trees, 'get_tip_by_processid', return_value=None):
+    with patch.object(mock_trees, 'get_node_by_processid', return_value=None):
         mock_trees.validate_taxonomy(mock_config, record, result)
         assert result.error == "process1 not in BOLD"
 
     # Test error case when BLAST fails
-    with patch.object(mock_trees, 'get_tip_by_processid', return_value=mock_species), \
+    with patch.object(mock_trees, 'get_node_by_processid', return_value=mock_species), \
             patch.object(mock_trees, 'build_constraint', return_value='1234'), \
             patch('barcode_validator.core.BlastRunner') as MockBlastRunner:
         MockBlastRunner.return_value.run_localblast.return_value = None
@@ -162,7 +171,8 @@ def test_validate_sequence_quality(mock_num_ambiguous, mock_marker_seqlength, mo
     mock_marker_seqlength.return_value = 4
     mock_num_ambiguous.side_effect = [0, 0]
 
-    BarcodeValidator.validate_sequence_quality(mock_config, record, result)
+    bv = BarcodeValidator(mock_config)
+    bv.validate_sequence_quality(mock_config, record, result)
 
     assert result.full_length == 4
     assert result.full_ambiguities == 0

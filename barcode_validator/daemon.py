@@ -2,15 +2,17 @@ import argparse
 import requests
 import time
 import os
-import logging
+import csv
+import yaml
 import sqlite3
 import traceback
 from datetime import datetime
 from typing import Optional
-from barcode_validator.config import Config
+from nbitk.config import Config
+from nbitk.logger import get_formatted_logger
 from barcode_validator.core import BarcodeValidator
 from barcode_validator.github import GitHubClient
-from barcode_validator.result import DNAAnalysisResult
+from barcode_validator.result import DNAAnalysisResult, DNAAnalysisResultSet
 
 
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
@@ -23,18 +25,20 @@ class ValidationDaemon:
         self.bv: Optional[BarcodeValidator] = None
         self.gc: Optional[GitHubClient] = None
         self.conn: Optional[sqlite3.Connection] = None
+        self.logger = None
 
     def initialize(self, config: Config):
-        self.bv = BarcodeValidator()
-        self.bv.initialize(config.get('ncbi_taxonomy'), config.get('bold_sheet_file'))
-        self.gc = GitHubClient(config.get('repo_owner'), config.get('repo_name'), GITHUB_TOKEN,
-                               config.get('repo_location'))
+        class_name = self.__class__.__name__
+        self.logger = get_formatted_logger(class_name, config)
+        self.bv = BarcodeValidator(config)
+        self.bv.initialize()
+        self.gc = GitHubClient(config)
         try:
-            logging.info(f"Going to initialize PR database at {config.get('pr_db_file')}")
+            self.logger.info(f"Going to initialize PR database at {config.get('pr_db_file')}")
             self.conn = self.setup_database(config.get('pr_db_file'))
-            logging.info("Database initialized")
+            self.logger.info("Database initialized")
         except Exception as e:
-            logging.error(f"Error setting up database: {str(e)}")
+            self.logger.error(f"Error setting up database: {str(e)}")
             exit(1)
 
     @classmethod
@@ -82,7 +86,7 @@ class ValidationDaemon:
                 error_msg = f"Error processing PR {pr_number}: {str(e)}\n"
                 error_msg += "Stack trace:\n"
                 error_msg += traceback.format_exc()
-                logging.error(error_msg)
+                self.logger.error(error_msg)
                 c.execute("UPDATE prs SET status = 'error', last_updated = ? WHERE pr_number = ?",
                           (datetime.now(), pr_number))
                 self.conn.commit()
@@ -98,10 +102,11 @@ class ValidationDaemon:
         c.execute("INSERT OR REPLACE INTO prs (pr_number, status, last_updated) VALUES (?, 'processing', ?)",
                   (pr_number, datetime.now()))
         self.conn.commit()
-        logging.info(f"Changed status of PR {pr_number} to 'processing'")
+        self.logger.info(f"Changed status of PR {pr_number} to 'processing'")
         self.gc.post_comment(pr_number, "\U0001F916 - Hi! This is an automated message from the barcode validation "
-                                        "robot. I'm going to validate the FASTA files in your request. Please wait "
-                                        "while I process the files. This takes about two minutes per sequence.")
+                                        "robot. I'm going to validate the FASTA files in your request. This takes " 
+                                        "less than two minutes per sequence (about two hours per plate). Subscribe "
+                                        "to this thread to get updates. You can safely close this tab.")
 
     def finalize_pr(self, pr_number):
         """
@@ -113,7 +118,7 @@ class ValidationDaemon:
         c.execute("UPDATE prs SET status = 'completed', last_updated = ? WHERE pr_number = ?",
                   (datetime.now(), pr_number))
         self.conn.commit()
-        logging.info(f"Changed status of PR {pr_number} to 'completed'")
+        self.logger.info(f"Changed status of PR {pr_number} to 'completed'")
         self.gc.post_comment(pr_number, "\U0001F916 - Validation complete. If all looks good, notify @rvosa to merge.")
 
     def validate_pr(self, config, pr_number, branch):
@@ -124,105 +129,100 @@ class ValidationDaemon:
         :param branch: The branch name
         :return: A dict where keys are FASTA file names and values are lists of DNAAnalysisResult objects
         """
-        logging.info(f"Starting validation for PR {pr_number}")
-        fasta_files = self.fetch_pr_fastas(branch, pr_number)
+        self.logger.info(f"Starting validation for PR {pr_number}")
+        fasta_files = self.gc.fetch_pr_files(branch, pr_number, ['.fasta', '.fa', '.fas'])
+        csv_files = self.gc.fetch_pr_files(branch, pr_number, ['.csv'])
+        yaml_files = self.gc.fetch_pr_files(branch, pr_number, ['.yaml', '.yml'])
 
         # Run the validation process for each FASTA file
         all_results = {}
         for file in fasta_files:
-            logging.info(f"Processing file: {file['filename']}")
 
-            # Fetch file content
-            file_url = file['raw_url']
-            logging.info(f"Fetching file from {file_url}")
-            response = requests.get(file_url, headers=self.gc.headers)
-            if response.status_code == 200:
-                # Create directory if it doesn't exist
-                os.makedirs(os.path.dirname(file['filename']), exist_ok=True)
+            # Validate file, store results
+            self.logger.info(f"Validating {file}...")
+            results = self.bv.validate_fasta(file, config)
+            rs = DNAAnalysisResultSet(results)
 
-                # Save file content
-                logging.info(f"Saving file content to {file['filename']}")
-                with open(file['filename'], 'wb') as f:
-                    f.write(response.content)
+            # Join the CSV and YAML file(s) to the results
+            self.join_csv_to_result(csv_files, file, rs)
+            self.join_yaml_to_result(yaml_files, file, rs)
 
-                # Validate file, store results
-                logging.info(f"Validating {file['filename']}...")
-                results = self.bv.validate_fasta(file['filename'], config)
-                all_results[file['filename']] = results
-                logging.info(f"Validation complete for {file['filename']}")
-            else:
-                logging.error(f"Failed to fetch file {file['filename']}: {response.status_code}")
+            all_results[file] = rs
+            self.logger.info(f"Validation complete for {file}")
 
-        logging.info(f"Validation complete for PR {pr_number}")
+        self.logger.info(f"Validation complete for PR {pr_number}")
         return all_results
 
-    def fetch_pr_fastas(self, branch, pr_number):
+    def join_yaml_to_result(self, yaml_files, file, resultset):
         """
-        Fetch the FASTA files from a pull request.
-        :param branch: The branch name
-        :param pr_number: The pull request number
-        :return: A list of FASTA files
+        Join the YAML file to the results.
+        :param yaml_files: List of YAML files
+        :param file: Processed FASTA file
+        :param resultset: DNAAnalysisResultSet object
+        :return:
         """
+        # See if there is a matching Y(A)ML file
+        base_name = os.path.splitext(file)[0]
+        if f'{base_name}.yaml' in yaml_files:
+            matching_file = f'{base_name}.yaml'
+        elif f'{base_name}.yml' in yaml_files:
+            matching_file = f'{base_name}.yml'
+        else:
+            matching_file = None
 
-        # Fetch the latest changes
-        logging.info(f"Fetching latest changes for PR {pr_number}")
-        self.gc.run_git_command(['git', 'fetch', 'origin'], "Failed to fetch from origin")
+        if matching_file is not None:
+            self.logger.info(f"Found YAML file for {file}")
+            resultset.add_yaml_file(matching_file)
 
-        # Create or reset the PR branch
-        pr_branch = f"pr-{pr_number}"
-        logging.info(f"Creating/resetting branch {pr_branch}")
-        self.gc.run_git_command(['git', 'checkout', '-B', pr_branch, f'origin/{branch}'],
-                                f"Failed to create/reset branch {pr_branch}")
+    def join_csv_to_result(self, csv_files, file, resultset):
+        """
+        Join the CSV file to the results.
+        :param csv_files: List of CSV files
+        :param file: Processed FASTA file
+        :param resultset: DNAAnalysisResultSet object
+        :return:
+        """
+        # See if there is a matching CSV file
+        base_name = os.path.splitext(file)[0]
+        if f'{base_name}.csv' in csv_files:
+            self.logger.info(f"Found CSV file for {file}")
+            resultset.add_csv_file(f'{base_name}.csv')
 
-        # Get the FASTA files from the PR
-        logging.info(f"Getting files for PR {pr_number}")
-        files = self.gc.get_pr_files(pr_number)
-        fasta_files = [f for f in files if f['filename'].endswith(('.fasta', '.fa', '.fas'))]
-        logging.info(f"Found {len(fasta_files)} FASTA files in PR {pr_number}")
-        return fasta_files
-
-    def post_pr_results(self, config, pr_number, resultset):
+    def post_pr_results(self, config, pr_number, results):
         """
         Post a comment to a pull request with the validation results.
         :param config: The Config object
         :param pr_number: The pull request number
-        :param resultset: A dict where keys are FASTA file names and values are lists of DNAAnalysisResult objects
+        :param results: A dict where keys are FASTA file names and values are lists of DNAAnalysisResultSet objects
         :return: None
         """
-        for file, results in resultset.items():
+        for file, resultset in results.items():
 
             # Open a new TSV file for each file
             tsv_name = f"{file}.tsv"
             tsv_fh = open(tsv_name, 'w', buffering=1)
 
-            # Configure the header for the TSV file by specifying the taxonomic rank at which we matched obs_taxon
-            # and by adding a column that specifies the FASTA file name
-            hlist = DNAAnalysisResult.result_fields(config.get('level'))
-            hlist.append('fasta_file')
-            tsv_fh.write('\t'.join(hlist) + '\n')
-
             # Write the result objects to the TSV file
-            for r in results:
+            for r in resultset.results:
                 r.level = config.get('level')  # will be serialized to identification_rank
-                rlist = r.get_values()  # will include obs_taxon
-                rlist.append(file)  # add the FASTA file name under the 'fasta_file' column
-                tsv_fh.write('\t'.join(map(str, rlist)) + '\n')
+                r.add_ancillary('fasta_file', file) # add the FASTA file name to the result
+            tsv_fh.write(str(resultset))
 
             # Close the TSV file and commit the files
             tsv_fh.close()
-            logging.info(f"Going to commit {file} and {tsv_name}")
+            self.logger.info(f"Going to commit {file} and {tsv_name}")
             self.gc.commit_file(file, f"Validated FASTA file {file} for #PR{pr_number}")
             self.gc.commit_file(tsv_name, f"Results from FASTA file {file} for #PR{pr_number}")
 
             # Post a comment with the validation results for the file
-            logging.info(f"Posting comment for {file}")
+            self.logger.info(f"Posting comment for {file}")
             comment = f"# Validation Results for {file}\n\n"
             for r in results:
                 comment = self.generate_markdown(comment, config, file, r)
             self.gc.post_comment(pr_number, comment)
 
         # Push the TSV files
-        logging.info(f"Pushing commits for PR {pr_number}")
+        self.logger.info(f"Pushing commits for PR {pr_number}")
         self.gc.run_git_command(['git', 'push', 'origin', f"pr-{pr_number}"], f"Failed to push branch pr-{pr_number}")
 
     @classmethod
@@ -278,37 +278,38 @@ def main(config_file, verbosity):
     # Initialize the Config object, setup logging
     config = Config()
     config.load_config(config_file)
-    config.setup_logging(verbosity)
-    logging.info("*** Barcode Validator Daemon starting ***")
+    config.set('log_level', verbosity)
+    logger = get_formatted_logger(__name__, config)
+    logger.info("*** Barcode Validator Daemon starting ***")
     daemon = ValidationDaemon()
     daemon.initialize(config)
 
     # Start the main loop
-    logging.info("Starting main loop")
+    logger.info("Starting main loop")
     while True:
 
-        # Get a list of open PRs and iterate over them
-        logging.info("Checking for open PRs...")
-        prs = daemon.gc.get_open_prs()
-        logging.info(f"Found {len(prs)} open PRs")
-        for pr in prs:
+        try:
+            # Get a list of open PRs and iterate over them
+            logger.info("Checking for open PRs...")
+            prs = daemon.gc.get_open_prs()
+            logger.info(f"Found {len(prs)} open PRs")
+            for pr in prs:
 
-            # Process PRs that contain FASTA files
-            pr_number = pr['number']
-            logging.info(f"Inspecting files from PR {pr['number']}...")
-            files = daemon.gc.get_pr_files(pr_number)
-            logging.info(f"Found {len(files)} files in PR {pr['number']}")
+                # Process PRs that contain FASTA files
+                pr_number = pr['number']
+                logger.info(f"Inspecting files from PR {pr['number']}...")
+                files = daemon.gc.get_pr_files(pr_number)
+                logger.info(f"Found {len(files)} files in PR {pr['number']}")
 
-            # Iterate over the files in the PR and process if any are FASTA files
-            if any(f['filename'].endswith(('.fasta', '.fa', '.fas')) for f in files):
-                logging.info(f"Processing PR {pr['number']}")
-                daemon.process_pr(config, pr_number, pr['head']['ref'])
+                # Iterate over the files in the PR and process if any are FASTA files
+                if any(f['filename'].endswith(('.fasta', '.fa', '.fas')) for f in files):
+                    logger.info(f"Processing PR {pr['number']}")
+                    daemon.process_pr(config, pr_number, pr['head']['ref'])
 
-        # Clean up old completed PRs
-        #        c = conn.cursor()
-        #        c.execute("DELETE FROM prs WHERE status = 'completed' AND last_updated < ?",
-        #                  (datetime.now() - timedelta(days=7),))
-        #        conn.commit()
+        except Exception as e:
+            logger.error(f"Error in main loop: {str(e)}")
+            logger.error(traceback.format_exc())
+            logger.info("Hopefully this was a transient error. Trying again in 5 minutes...")
 
         time.sleep(POLL_INTERVAL)
 

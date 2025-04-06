@@ -36,7 +36,7 @@ word_size: 28
 # The BLASTDB environment variable is used to specify the location of the BLAST database. The BLASTDB_LMDB_MAP_SIZE
 # environment variable is used to specify the amount of RAM allocated to the blastn job. For some reason, setting the
 # latter to any value causes the blastn job to fail with a segmentation fault. So let's not do that.
-BLASTDB_LMDB_MAP_SIZE: 1000G
+BLASTDB_LMDB_MAP_SIZE: 128G
 BLASTDB: /home/rutger.vos/data/ncbi/nt
 
 # Location of the NCBI taxonomy dump. This must be the tar.gz file that contains the nodes.dmp and names.dmp files.
