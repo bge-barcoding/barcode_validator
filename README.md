@@ -1,59 +1,276 @@
-Introduction
-============
+# DNA Barcode Validator
 
-Sequences of the DNA barcode marker COI are produced in a variety of ways, including 
-by genome skimming of old collection specimens, by nanopore sequencing on ONT platforms,
-and by smrt sequencing on the PacBio Sequel platform. In all cases, the resulting 
-sequence ought to be validated before publishing. This project aims to provide a 
-universal solution for this, in order to meet the needs of the [BGE](https://biodiversitygenomics.eu/)
-project and the [ARISE](https://www.arise-biodiversity.nl/) project. Broadly speaking,
-what is provided here is a service that does the following:
+A Python-based toolkit for validating DNA barcode sequences through structural and taxonomic validation. This tool 
+helps ensure sequence quality and taxonomic accuracy for submissions to the Barcode of Life Data System (BOLD)
+and to Naturalis's DNA domain within the BioCloud.
 
-1. Check to see if the expected taxon and that observed by checking the sequence against
-   a reference database (GenBank or BOLD) match. The match can be performed at a higher
-   taxonomic level, e.g. the family. Mismatches may indicate contaminations.
-2. Check to see if there are no early stop codons in the amino acid translation. Early
-   stop codons may indicate the erroneous amplification of a pseudogene copy, such as
-   a NUMT sequence.
-3. Persist the validation results somewhere. At present nothing is effectively done with
-   this, but the hooks are there to persist to some data store, like a google sheet, a
-   database, or a file. Now the output is simply printed to the console as TSV.
+## Features
 
-Usage
------
+- **Structural validation** of DNA barcodes:
+  - Sequence length requirements
+  - Ambiguous base detection
+  - Stop codon analysis for protein-coding markers
+  - HMM-based alignment for codon phase detection
 
-## Web usage
+- **Taxonomic validation**:
+  - Validation against ID service reference databases (BOLD, Galaxy BLAST)
+  - Flexible taxonomy mapping (NSR, NCBI or BOLD)
+  - Support for multiple taxonomic ranks
 
-The easiest way to use this functionality is by submitting a file to validate as per the
-instructions given in the [data](data) section. This will trigger a bot to run the
-validation and post the results as tabular output and summary reporting connected to 
-the upload. This will only work if your upload is connected to the BGE project.
+- **Triaging and filtering**:
+  - Automatic selection of best valid sequence per specimen or sample group
+  - Support for assembly attempt grouping
+  - Customizable triage criteria
 
-## Command line usage
+- **Input/Output**:
+  - Support for FASTA and tabular input formats
+  - BOLD Excel spreadsheet integration
+  - Detailed validation reports in TSV format
+  - Filtered FASTA output for valid sequences
+  - Integration with Galaxy workflow platform
 
-The tooling can also be deployed locally. Dependency management is done via conda and
-so installation is fairly painless. However, the local deployment will also require a
-BLAST database that is indexed with taxon IDs from the NCBI taxonomy. This is the standard
-`nr` database that can be downloaded using tools that come with the NCBI BLAST+ release
-(which is part of the conda environment). Once that is downloaded and the 
-[config file](config/config.yml) is updated as needed, the tool can be used as follows:
+## Installation
 
-To get help:
+### Using pip
 
-```
-python barcode_validator -h
+Install the barcode validator from PyPI using pip:
+
+```bash
+pip install barcode-validator
 ```
 
-To validate a FASTA file:
+Note: Additional dependencies (BLAST and HMMER) may need to be installed separately depending on your use case.
 
+### Using bioconda
+
+The recommended way to install a complete environment with all dependencies is using 
+[bioconda](https://bioconda.github.io/):
+
+```bash
+conda create -n barcode-validator
+conda activate barcode-validator
+conda install -c bioconda barcode-validator blast hmmer
 ```
-python barcode_validator -f examples/mge.fa -c config/config.yml
+
+This will install the barcode validator along with BLAST and HMMER, which are required for taxonomic and structural 
+validation respectively.
+
+## Usage
+
+### Command Line Interface
+
+The barcode validator can be run as a Python module:
+
+```bash
+python -m barcode_validator [options]
 ```
 
-## Programmatic usage
+Below are detailed examples for common use cases, particularly for the **BGE (Biodiversity Genomics Europe)** and 
+**ARISE** projects.
 
-The components of the toolset are programmed as object-oriented Python classes. The
-classes have a reasonable separation of concerns such that other applications can
-be composed out of them. To get started with this, peruse the Python files in the
-[barcode_validator](barcode_validator) folder and the unit tests in the [tests](tests)
-folder.
+#### BGE Use Case: Structural and Taxonomic Validation with Assembly Triage
+
+The BGE use case involves validating sequences from multiple genome skimming assembly attempts per specimen, selecting 
+the best valid sequence per specimen, and performing taxonomic validation using the Galaxy BLAST web service.
+
+**Input requirements:**
+- FASTA file with sequences where IDs are formatted as `processID_assemblyAttemptID`
+- CSV file with assembly metrics (optional but recommended)
+- BOLD Excel spreadsheet with 'Lab Sheet' and 'Taxonomy' tabs
+- Galaxy API credentials for taxonomic validation
+
+**Example: Two-stage validation**
+
+First, perform structural validation with early triage:
+
+```bash
+# Set up input and output files
+INPUT_FASTA=data/sequences.fasta
+INPUT_CSV=data/metrics.csv
+BOLD_EXCEL=data/bold_spreadsheet.xlsx
+STRUCTVAL_FASTA=data/structval_out.fasta
+STRUCTVAL_TSV=data/structval_out.tsv
+
+# Run structural validation
+python -m barcode_validator \
+  --input-file $INPUT_FASTA \
+  --csv-file $INPUT_CSV \
+  --mode structural \
+  --marker COI-5P \
+  --input-resolver format=bold \
+  --input-resolver file=$BOLD_EXCEL \
+  --output-fasta $STRUCTVAL_FASTA \
+  --output-tsv $STRUCTVAL_TSV \
+  --triage-config group_id_separator=_ \
+  --triage-config group_by_sample=true \
+  --log-level INFO 2> structval.log
+```
+
+Then, perform taxonomic validation on the triaged results:
+
+```bash
+# Set Galaxy credentials
+export GALAXY_API_KEY=your_galaxy_api_key
+export GALAXY_DOMAIN=galaxy.naturalis.nl
+
+# Set output files
+TAXVAL_FASTA=data/taxonval_out.fasta
+TAXVAL_TSV=data/taxonval_out.tsv
+
+# Run taxonomic validation
+python -m barcode_validator \
+  --input-file $STRUCTVAL_FASTA \
+  --csv-file $INPUT_CSV \
+  --mode taxonomic \
+  --marker COI-5P \
+  --input-resolver format=bold \
+  --input-resolver file=$BOLD_EXCEL \
+  --output-fasta $TAXVAL_FASTA \
+  --output-tsv $TAXVAL_TSV \
+  --taxon-validation method=galaxy \
+  --taxon-validation rank=family \
+  --taxon-validation min_identity=0.8 \
+  --taxon-validation max_target_seqs=100 \
+  --log-level INFO 2> taxonval.log
+```
+
+**Example: Combined validation in one step**
+
+For more thorough validation where all structurally valid sequences are checked taxonomically before triaging:
+
+```bash
+python -m barcode_validator \
+  --input-file $INPUT_FASTA \
+  --csv-file $INPUT_CSV \
+  --mode both \
+  --marker COI-5P \
+  --input-resolver format=bold \
+  --input-resolver file=$BOLD_EXCEL \
+  --output-fasta data/validated_out.fasta \
+  --output-tsv data/validated_out.tsv \
+  --taxon-validation method=galaxy \
+  --taxon-validation rank=family \
+  --taxon-validation min_identity=0.8 \
+  --taxon-validation max_target_seqs=100 \
+  --triage-config group_id_separator=_ \
+  --triage-config group_by_sample=true \
+  --log-level INFO 2> validation.log
+```
+
+#### ARISE Use Case: Simple Validation Without Assembly Grouping
+
+The ARISE use case involves validating individual sequences (one per specimen) with both structural and taxonomic 
+validation using the BOLD web service. This case is focused on fresh specimen sequencing, either by ONT or Sanger,
+which lacks the brute forcing that BGE requires.
+
+**Input requirements:**
+- FASTA file with sequences where the first word of the definition line is the process ID
+- BOLD Excel spreadsheet with 'Lab Sheet' and 'Taxonomy' tabs
+
+**Example:**
+
+```bash
+python -m barcode_validator \
+  --input-file input_sequences.fasta \
+  --mode both \
+  --marker COI-5P \
+  --input-resolver format=bold \
+  --input-resolver file=bold_spreadsheet.xlsx \
+  --output-fasta validated_sequences.fasta \
+  --output-tsv validation_report.tsv \
+  --taxon-validation method=bold \
+  --taxon-validation rank=family \
+  --taxon-validation min_identity=0.8 \
+  --taxon-validation max_target_seqs=100 \
+  --triage-config group_by_sample=false \
+  --log-level ERROR 2> validation.log
+```
+
+This produces a FASTA file with valid sequences and a TSV file with detailed validation results.
+
+#### Common Options
+
+- `--input-file`: Input FASTA file with sequences to validate
+- `--csv-file`: Optional CSV file with additional metrics
+- `--mode`: Validation mode (`structural`, `taxonomic`, or `both`)
+- `--marker`: Marker gene (e.g., `COI-5P`)
+- `--input-resolver format=bold`: Use BOLD spreadsheet for taxonomy
+- `--input-resolver file=<path>`: Path to BOLD Excel spreadsheet
+- `--output-fasta`: Output FASTA file with valid sequences
+- `--output-tsv`: Output TSV file with validation results
+- `--taxon-validation method=<bold|galaxy>`: Taxonomic validation service
+- `--taxon-validation rank=<rank>`: Taxonomic rank to validate at
+- `--taxon-validation min_identity=<float>`: Minimum identity threshold (0-1)
+- `--taxon-validation max_target_seqs=<int>`: Maximum number of BLAST hits to consider
+- `--triage-config group_id_separator=<char>`: Separator for parsing group IDs
+- `--triage-config group_by_sample=<true|false>`: Enable/disable assembly attempt grouping
+- `--log-level`: Logging level (`ERROR`, `INFO`, `DEBUG`)
+
+### Galaxy Integration
+
+The structural validation functionality is also available through the Galaxy platform:
+
+- **Galaxy Toolshed**: The barcode validator structural validation tool is available in the Galaxy Toolshed, 
+  enabling easy installation into any Galaxy instance.
+- **Web-based interface**: Users can upload sequence files, configure validation parameters through the GUI, 
+  run validations, and download results.
+- **Workflow integration**: The tool can be incorporated into Galaxy workflows for automated processing pipelines.
+
+To use the tool in Galaxy:
+1. Install the tool from the Galaxy Toolshed (search for "barcode validator")
+2. Upload your sequence files to your Galaxy history
+3. Configure validation parameters through the GUI
+4. Run the validation
+5. View results and download validation reports and filtered sequences
+
+For taxonomic validation through Galaxy, the tool can connect to Galaxy's BLAST web service using API credentials.
+
+## Contributing
+
+We welcome contributions! Please see:
+- [Contributing Guidelines](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+
+When contributing, please ensure:
+- Code follows PEP 8 style guidelines
+- All functions and classes include docstrings
+- New features include unit tests
+- All tests pass before submitting a pull request
+
+## Testing
+
+Run the test suite to verify your installation:
+
+```bash
+# Run all tests
+pytest
+
+# Run with coverage report
+pytest --cov=barcode_validator
+
+# Run specific test suites
+pytest tests/bge/
+pytest tests/arise/
+```
+
+The test suite includes comprehensive examples for BGE and ARISE use cases.
+
+## License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE.md](LICENSE.md) file for details.
+
+## Citation
+
+If you use this software in your research, please cite this repository. An application note (to JOSS) that 
+describes the software is in preparation.
+
+## Contact
+
+For questions, issues, or contributions:
+- GitHub Issues: https://github.com/naturalis/barcode_validator/issues
+- Email: rutger.vos@naturalis.nl
+
+## Acknowledgments
+
+This tool was developed to support the Biodiversity Genomics Europe (BGE) and ARISE projects, as well as general DNA 
+barcoding initiatives at Naturalis Biodiversity Center.
